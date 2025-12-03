@@ -223,6 +223,16 @@ def fetch_markets_windowed(end_min: dt.datetime,
     """
     results: List[Dict[str, Any]] = []
 
+    def _extract(payload: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """提取 markets 列表和 cursor，兼容 list / dict 返回值。"""
+        if isinstance(payload, list):
+            return payload, None
+        if isinstance(payload, dict):
+            mkts = payload.get("data") or payload.get("markets") or []
+            cursor = payload.get("nextCursor") or payload.get("cursor")
+            return mkts, cursor
+        return [], None
+
     def _split_window(start: dt.datetime, stop: dt.datetime):
         # 若窗口结束时间早于最小开始时间，跳过
         if stop <= start:
@@ -237,9 +247,8 @@ def fetch_markets_windowed(end_min: dt.datetime,
                 except Exception as e:
                     print(f"[WARN] fetch_markets_page 失败：{e}", file=sys.stderr)
                     break
-                mkts = data.get("data") or data.get("markets") or []
+                mkts, cursor = _extract(data)
                 results.extend(mkts)
-                cursor = data.get("nextCursor") or data.get("cursor")
                 if not cursor or len(mkts) < GAMMA_PAGE_LIMIT:
                     break
             return
@@ -250,7 +259,7 @@ def fetch_markets_windowed(end_min: dt.datetime,
         except Exception as e:
             print(f"[WARN] fetch_markets_page（window）失败：{e}", file=sys.stderr)
             return
-        mkts = data.get("data") or data.get("markets") or []
+        mkts, cursor = _extract(data)
         if len(mkts) >= GAMMA_PAGE_LIMIT:
             # 命中上限：继续二分
             mid = start + dt.timedelta(hours=span_hours / 2.0)
@@ -259,16 +268,14 @@ def fetch_markets_windowed(end_min: dt.datetime,
         else:
             # 未命中上限，可按 cursor 继续抓完
             results.extend(mkts)
-            cursor = data.get("nextCursor") or data.get("cursor")
             while cursor:
                 try:
                     data2 = fetch_markets_page(start, stop, cursor)
                 except Exception as e:
                     print(f"[WARN] fetch_markets_page（cursor）失败：{e}", file=sys.stderr)
                     break
-                mkts2 = data2.get("data") or data2.get("markets") or []
+                mkts2, cursor = _extract(data2)
                 results.extend(mkts2)
-                cursor = data2.get("nextCursor") or data2.get("cursor")
                 if not cursor or len(mkts2) < GAMMA_PAGE_LIMIT:
                     break
 
