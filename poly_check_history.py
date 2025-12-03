@@ -15,7 +15,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 from urllib.parse import urlparse
 
 import requests
@@ -162,6 +162,26 @@ def fetch_markets_for_event(event_id: str) -> List[Dict]:
     return list(markets)
 
 
+def _extract_tag_set(tags: Optional[List]) -> Set[str]:
+    """提取 tag 的 slug/name/id，方便做交集判断。"""
+    values: Set[str] = set()
+    if not tags:
+        return values
+    for tag in tags:
+        if isinstance(tag, str):
+            values.add(tag.lower())
+        elif isinstance(tag, dict):
+            for key in ("slug", "name", "id"):
+                val = tag.get(key)
+                if val:
+                    values.add(str(val).lower())
+    return values
+
+
+def _keyword_hit_count(slug_lower: str, keywords: List[str]) -> int:
+    return sum(1 for k in keywords if k in slug_lower)
+
+
 def fetch_historical_events(current_event: EventData, keywords: List[str]) -> List[EventData]:
     """优先按 seriesSlug 查询历史事件，失败再回退到关键字搜索。"""
     if not keywords:
@@ -174,6 +194,9 @@ def fetch_historical_events(current_event: EventData, keywords: List[str]) -> Li
     params_list.append({"search": search_phrase, "closed": True})
 
     results: Dict[str, EventData] = {}
+    current_tags = _extract_tag_set(current_event.tags)
+    # 关键字命中阈值：至少 2 个，或仅有 1 个关键字时要求 1 个
+    min_keyword_hits = max(1, min(2, len(keywords)))
     for params in params_list:
         data = _fetch_json(f"{GAMMA_HOST}/events", params=params)
         events: Iterable[Dict] = data if isinstance(data, list) else data.get("events", [])
@@ -186,22 +209,44 @@ def fetch_historical_events(current_event: EventData, keywords: List[str]) -> Li
             question = item.get("question") or item.get("title") or event_slug
             markets = item.get("markets") or []
             slug_lower = (event_slug or "").lower()
-            if params.get("seriesSlug") or all(k in slug_lower for k in keywords):
-                if event_id not in results:
-                    results[event_id] = EventData(
-                        event_id=event_id or event_slug,
-                        slug=event_slug,
-                        question=question,
-                        markets=markets,
-                        series_slug=item.get("seriesSlug"),
-                        tags=item.get("tags"),
-                    )
+            hits = _keyword_hit_count(slug_lower, keywords)
+            candidate_tags = _extract_tag_set(item.get("tags"))
+            # 1) tag 不冲突（若双方都有 tag，需有交集）；2) slug 关键词至少命中阈值
+            tag_ok = not current_tags or not candidate_tags or bool(current_tags & candidate_tags)
+            keyword_ok = hits >= min_keyword_hits
+            if not (tag_ok and keyword_ok):
+                continue
+            if event_id not in results:
+                results[event_id] = EventData(
+                    event_id=event_id or event_slug,
+                    slug=event_slug,
+                    question=question,
+                    markets=markets,
+                    series_slug=item.get("seriesSlug"),
+                    tags=item.get("tags"),
+                )
     return list(results.values())
+
+
+def _detect_market_type(market: Dict) -> str:
+    text = (market.get("question") or market.get("title") or market.get("slug") or "").lower()
+    if any(key in text for key in ["spread", " handicap", " +", " -"]):
+        return "spread"
+    if any(key in text for key in ["total", "over/under", "o/u", "over", "under"]):
+        return "total"
+    if any(key in text for key in ["moneyline", "ml", "win", "vs", " at "]):
+        return "moneyline"
+    return "unknown"
 
 
 def parse_market_result(market: Dict) -> MarketResult:
     outcomes = market.get("outcomes") or []
-    winning = market.get("outcome") or None
+    winning = (
+        market.get("outcome")
+        or market.get("winningOutcome")
+        or market.get("winning_outcome")
+        or market.get("winningOutcomeIndex")
+    )
     # 尝试从最终价格判断赢家
     price_field = market.get("outcomePrices") or market.get("prices") or []
     if not winning and isinstance(price_field, list):
@@ -212,6 +257,14 @@ def parse_market_result(market: Dict) -> MarketResult:
                     break
             except (TypeError, ValueError):
                 continue
+    # 如果 winningOutcomeIndex 是数字，尝试映射到 outcomes
+    try:
+        if winning is not None and isinstance(winning, (int, float)) and outcomes:
+            idx = int(winning)
+            if 0 <= idx < len(outcomes):
+                winning = outcomes[idx]
+    except (TypeError, ValueError):
+        pass
     return MarketResult(
         market_id=str(market.get("id") or market.get("_id") or market.get("market_id") or ""),
         question=market.get("question") or market.get("title") or "",
@@ -258,11 +311,15 @@ def main() -> None:
     keywords = derive_keywords(event.slug or slug)
     historical_events = fetch_historical_events(event, keywords)
 
+    target_market_type = _detect_market_type(market)
+
     historical_results: List[MarketResult] = []
     for ev in historical_events:
         if not ev.markets:
             ev.markets = fetch_markets_for_event(ev.event_id)
         for mk in ev.markets:
+            if target_market_type != "unknown" and _detect_market_type(mk) != target_market_type:
+                continue
             historical_results.append(parse_market_result(mk))
 
     # 当前选中盘也加入统计，方便对比
