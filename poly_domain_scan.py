@@ -236,8 +236,11 @@ def fetch_price_history(token_id: str, start_ts: int, end_ts: int, fidelity: int
 
 
 def collect_price_points(record: MarketRecord, fidelity: int) -> List[PricePoint]:
-    start_ts = _to_unix(record.created_at) or int(time.time() - 7 * 86400)
-    end_ts = _to_unix(record.closed_time) or int(time.time())
+    now_ts = int(time.time())
+    start_ts = min(_to_unix(record.created_at) or now_ts - 7 * 86400, now_ts)
+    end_ts = min(_to_unix(record.closed_time) or now_ts, now_ts)
+    if end_ts <= start_ts:
+        return []
     points: List[PricePoint] = []
     for outcome, token_id in zip(record.outcomes, record.token_ids):
         history = fetch_price_history(token_id, start_ts, end_ts, fidelity)
