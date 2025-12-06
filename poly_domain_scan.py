@@ -58,6 +58,7 @@ class MarketRecord:
 @dataclass
 class PricePoint:
     event_slug: str
+    market_id: str
     market_slug: str
     outcome: str
     timestamp: int
@@ -78,6 +79,14 @@ def _fetch_json(url: str, params: Optional[Dict] = None) -> Dict:
 
 def _parse_date(text: str) -> dt.datetime:
     return dt.datetime.strptime(text, "%Y-%m-%d")
+
+
+def _datetime_to_ts(value: dt.datetime | None) -> int:
+    if value is None:
+        return 0
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.timezone.utc)
+    return int(value.timestamp())
 
 
 def _to_unix(ts: str) -> Optional[int]:
@@ -367,30 +376,52 @@ def fetch_price_history(token_id: str, start_ts: int, end_ts: int, fidelity: int
     return result
 
 
-def collect_price_points(record: MarketRecord, fidelity: int) -> List[PricePoint]:
+def _determine_price_window(record: MarketRecord, default_start_ts: int, default_end_ts: int) -> Tuple[int, int]:
+    """为价格抓取确定统一的起止时间，优先使用命令行指定的时间范围。"""
+
     now_ts = int(time.time())
-    start_ts = min(_to_unix(record.created_at) or now_ts - 7 * 86400, now_ts)
-    end_ts = min(_to_unix(record.closed_time) or now_ts, now_ts)
+    start_ts = default_start_ts or 0
+    end_ts = default_end_ts or now_ts
+
+    # 若未显式指定时间范围，再退回到盘口元数据的创建/关闭时间
+    if not start_ts:
+        start_ts = min(_to_unix(record.created_at) or now_ts - 7 * 86400, now_ts)
+    if not end_ts:
+        end_ts = min(_to_unix(record.closed_time) or now_ts, now_ts)
+    return start_ts, end_ts
+
+
+def collect_price_points(
+    record: MarketRecord, fidelity: int, start_ts: int, end_ts: int
+) -> List[PricePoint]:
+    start_ts, end_ts = _determine_price_window(record, start_ts, end_ts)
     if end_ts <= start_ts:
-        print(f"[WARN] 跳过价格拉取（时间范围异常）：slug={record.market_slug!r}, start={start_ts}, end={end_ts}")
+        print(
+            f"[WARN] 跳过价格拉取（时间范围异常）：slug={record.market_slug!r}, start={start_ts}, end={end_ts}"
+        )
         return []
     if not record.market_slug:
         print(f"[WARN] 跳过价格拉取（缺少 market_slug）")
         return []
+
     points: List[PricePoint] = []
+    missing_tokens: List[str] = []
     for outcome, token_id in zip(record.outcomes, record.token_ids):
         if not token_id:
-            print(f"[WARN] 跳过 outcome（缺少 token_id）：slug={record.market_slug!r}, outcome={outcome!r}")
+            missing_tokens.append(outcome)
             continue
+
         history = fetch_price_history(token_id, start_ts, end_ts, fidelity)
         if not history:
             print(f"[WARN] 未获取到价格历史：slug={record.market_slug!r}, token={token_id}")
             continue
+
         for t, p in history:
             price_prob = p / 10000 if p > 1 else p / 100
             points.append(
                 PricePoint(
                     event_slug=record.event_slug,
+                    market_id=record.market_id,
                     market_slug=record.market_slug,
                     outcome=outcome,
                     timestamp=t,
@@ -399,6 +430,17 @@ def collect_price_points(record: MarketRecord, fidelity: int) -> List[PricePoint
                 )
             )
         time.sleep(0.1)
+
+    if missing_tokens:
+        print(
+            f"[WARN] 盘口缺少 token_id，未能抓取所有 outcome：slug={record.market_slug!r}, 缺失={missing_tokens}"
+        )
+    expected = len(record.outcomes)
+    actual = len({pt.outcome for pt in points})
+    if expected and actual and actual < expected:
+        print(
+            f"[WARN] 盘口价格历史不完整：slug={record.market_slug!r}, outcomes={expected}, fetched={actual}"
+        )
     return points
 
 
@@ -440,6 +482,7 @@ def load_price_points_from_csv(path: str) -> List[PricePoint]:
             points.append(
                 PricePoint(
                     event_slug=row.get("event_slug", ""),
+                    market_id=row.get("market_id", ""),
                     market_slug=row.get("market_slug", ""),
                     outcome=row.get("outcome", ""),
                     timestamp=timestamp,
@@ -533,10 +576,20 @@ def export_csv(records: List[MarketRecord], prices: List[PricePoint], path: str)
 
     with open(prices_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["event_slug", "market_slug", "outcome", "timestamp", "price_raw", "price_prob"])
+        writer.writerow(
+            ["event_slug", "market_id", "market_slug", "outcome", "timestamp", "price_raw", "price_prob"]
+        )
         for pt in prices:
             writer.writerow(
-                [pt.event_slug, pt.market_slug, pt.outcome, pt.timestamp, pt.price_raw, pt.price_prob]
+                [
+                    pt.event_slug,
+                    pt.market_id,
+                    pt.market_slug,
+                    pt.outcome,
+                    pt.timestamp,
+                    pt.price_raw,
+                    pt.price_prob,
+                ]
             )
 
     return markets_path, prices_path
@@ -602,6 +655,8 @@ def main() -> None:
         print(f"已加载本地数据：{markets_path} 与 {prices_path}")
     else:
         start_date, end_date = determine_date_range(args)
+        start_ts = _datetime_to_ts(start_date)
+        end_ts = _datetime_to_ts(end_date)
 
         resolver = DomainResolver(
             esports_tag_hints=args.esports_tag_hints.split(",") if args.esports_tag_hints else None
@@ -624,7 +679,14 @@ def main() -> None:
 
         price_points: List[PricePoint] = []
         for rec in records:
-            price_points.extend(collect_price_points(rec, fidelity=args.fidelity))
+            price_points.extend(
+                collect_price_points(
+                    rec,
+                    fidelity=args.fidelity,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                )
+            )
 
         markets_path, prices_path = export_csv(records, price_points, args.output)
         print(f"完成，盘口信息写入 {markets_path}，价格历史写入 {prices_path}")
