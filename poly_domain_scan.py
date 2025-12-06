@@ -166,9 +166,7 @@ def fetch_markets(domain: str, sports: Optional[List[str]], days: int, min_volum
                 continue
 
             created_ts = _parse_timestamp(
-                market.get("createdAt")
-                or market.get("openDate")
-                or market.get("startDate")
+                market.get("createdAt") or market.get("openDate") or market.get("startDate")
             )
             if created_ts and created_ts < start_ts:
                 continue
