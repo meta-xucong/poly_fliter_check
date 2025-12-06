@@ -34,8 +34,6 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-import requests
-
 GAMMA_HOST = os.environ.get("GAMMA_HOST", "https://gamma-api.polymarket.com").rstrip("/")
 CLOB_HOST = os.environ.get("CLOB_HOST", "https://clob.polymarket.com").rstrip("/")
 
@@ -67,6 +65,8 @@ class PricePoint:
 
 
 def _fetch_json(url: str, params: Optional[Dict] = None) -> Dict:
+    import requests
+
     try:
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
@@ -143,6 +143,13 @@ def _normalize_outcomes(raw_outcomes: Sequence[str] | str | None) -> List[str]:
         if text:
             cleaned.append(text)
     return cleaned
+
+
+def _safe_float(value: str | float | int | None) -> float:
+    try:
+        return float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class DomainResolver:
@@ -345,6 +352,93 @@ def collect_price_points(record: MarketRecord, fidelity: int) -> List[PricePoint
     return points
 
 
+def load_market_records_from_csv(path: str) -> List[MarketRecord]:
+    records: List[MarketRecord] = []
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            outcomes = _normalize_outcomes(row.get("outcomes"))
+            token_ids = _parse_token_ids(row.get("token_ids"))
+            records.append(
+                MarketRecord(
+                    event_slug=row.get("event_slug", ""),
+                    event_question=row.get("event_question", ""),
+                    market_id=row.get("market_id", ""),
+                    market_slug=row.get("market_slug", ""),
+                    market_question=row.get("market_question", ""),
+                    market_type=row.get("market_type", ""),
+                    outcomes=outcomes,
+                    token_ids=token_ids,
+                    created_at=row.get("created_at"),
+                    closed_time=row.get("closed_time"),
+                    game_start_time=row.get("game_start_time"),
+                    volume=_safe_float(row.get("volume")),
+                )
+            )
+    return records
+
+
+def load_price_points_from_csv(path: str) -> List[PricePoint]:
+    points: List[PricePoint] = []
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                timestamp = int(row.get("timestamp", "0") or 0)
+            except ValueError:
+                timestamp = 0
+            points.append(
+                PricePoint(
+                    event_slug=row.get("event_slug", ""),
+                    market_slug=row.get("market_slug", ""),
+                    outcome=row.get("outcome", ""),
+                    timestamp=timestamp,
+                    price_raw=_safe_float(row.get("price_raw")),
+                    price_prob=_safe_float(row.get("price_prob")),
+                )
+            )
+    return points
+
+
+def export_wide_prices(
+    records: List[MarketRecord], prices: List[PricePoint], output_path: str
+) -> str:
+    """将价格历史按盘口与时间戳合并为宽表，每个 outcome 拆为单独列。"""
+
+    if not records or not prices:
+        raise SystemExit("记录或价格列表为空，无法生成宽表。")
+
+    record_map: Dict[str, MarketRecord] = {rec.market_slug: rec for rec in records}
+    max_outcomes = max((len(rec.outcomes) for rec in records), default=0)
+    header = ["event_slug", "market_slug", "market_question", "market_type", "timestamp"]
+    for idx in range(max_outcomes):
+        header.extend([f"outcome_{idx + 1}_name", f"outcome_{idx + 1}_prob"])
+
+    grouped: Dict[Tuple[str, int], Dict[str, float]] = {}
+    for pt in prices:
+        key = (pt.market_slug, pt.timestamp)
+        bucket = grouped.setdefault(key, {})
+        bucket[pt.outcome] = pt.price_prob
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        for (market_slug, ts), outcome_map in sorted(grouped.items()):
+            rec = record_map.get(market_slug)
+            if not rec:
+                continue
+            row = [rec.event_slug, market_slug, rec.market_question, rec.market_type, ts]
+            for name in rec.outcomes:
+                row.extend([name, outcome_map.get(name)])
+            # 填满剩余 outcome 列（有的盘口只有两个 outcome）
+            remaining = max_outcomes - len(rec.outcomes)
+            for _ in range(remaining):
+                row.extend(["", ""])
+            writer.writerow(row)
+
+    return output_path
+
+
 def export_csv(records: List[MarketRecord], prices: List[PricePoint], path: str) -> Tuple[str, str]:
     root, ext = os.path.splitext(path)
     ext = ext or ".csv"
@@ -419,6 +513,21 @@ def parse_args() -> argparse.Namespace:
         dest="esports_tag_hints",
         help="电竞标签线索（id/slug/label），逗号分隔，用于 domain=esports",
     )
+    parser.add_argument(
+        "--markets-csv",
+        dest="markets_csv",
+        help="使用本地 markets_history.csv，跳过 API 抓取",
+    )
+    parser.add_argument(
+        "--prices-csv",
+        dest="prices_csv",
+        help="使用本地 markets_history_prices.csv，跳过价格抓取",
+    )
+    parser.add_argument(
+        "--wide-output",
+        dest="wide_output",
+        help="输出宽表路径（按盘口合并 outcome 列），例如 merged_prices.csv",
+    )
     return parser.parse_args()
 
 
@@ -434,31 +543,45 @@ def determine_date_range(args: argparse.Namespace) -> Tuple[dt.datetime, dt.date
 
 def main() -> None:
     args = parse_args()
-    start_date, end_date = determine_date_range(args)
+    # 支持直接使用已有 CSV，方便快速合并为宽表
+    if args.markets_csv and args.prices_csv:
+        records = load_market_records_from_csv(args.markets_csv)
+        price_points = load_price_points_from_csv(args.prices_csv)
+        markets_path = args.markets_csv
+        prices_path = args.prices_csv
+        print(f"已加载本地数据：{markets_path} 与 {prices_path}")
+    else:
+        start_date, end_date = determine_date_range(args)
 
-    resolver = DomainResolver(
-        esports_tag_hints=args.esports_tag_hints.split(",") if args.esports_tag_hints else None
-    )
-    resolver.load_metadata()
-    sports_list = args.sports.split(",") if args.sports else None
-    custom_tags = args.tags.split(",") if args.tags else None
-    tag_ids = resolver.resolve(args.domain, sports=sports_list, custom_tags=custom_tags)
-    if not tag_ids:
-        raise SystemExit("未能解析到有效的 tag id，请检查 domain/sports/tags 设置。")
+        resolver = DomainResolver(
+            esports_tag_hints=args.esports_tag_hints.split(",") if args.esports_tag_hints else None
+        )
+        resolver.load_metadata()
+        sports_list = args.sports.split(",") if args.sports else None
+        custom_tags = args.tags.split(",") if args.tags else None
+        tag_ids = resolver.resolve(args.domain, sports=sports_list, custom_tags=custom_tags)
+        if not tag_ids:
+            raise SystemExit("未能解析到有效的 tag id，请检查 domain/sports/tags 设置。")
 
-    sports_market_types = (
-        [t.strip() for t in args.sports_market_types.split(",") if t.strip()] if args.sports_market_types else None
-    )
-    markets_raw = fetch_markets(tag_ids, start_date, end_date, sports_market_types=sports_market_types)
-    records = build_market_records(markets_raw, min_volume=args.min_volume)
-    print(f"共获取盘口 {len(records)} 个，准备拉取价格历史…")
+        sports_market_types = (
+            [t.strip() for t in args.sports_market_types.split(",") if t.strip()]
+            if args.sports_market_types
+            else None
+        )
+        markets_raw = fetch_markets(tag_ids, start_date, end_date, sports_market_types=sports_market_types)
+        records = build_market_records(markets_raw, min_volume=args.min_volume)
+        print(f"共获取盘口 {len(records)} 个，准备拉取价格历史…")
 
-    price_points: List[PricePoint] = []
-    for rec in records:
-        price_points.extend(collect_price_points(rec, fidelity=args.fidelity))
+        price_points: List[PricePoint] = []
+        for rec in records:
+            price_points.extend(collect_price_points(rec, fidelity=args.fidelity))
 
-    markets_path, prices_path = export_csv(records, price_points, args.output)
-    print(f"完成，盘口信息写入 {markets_path}，价格历史写入 {prices_path}")
+        markets_path, prices_path = export_csv(records, price_points, args.output)
+        print(f"完成，盘口信息写入 {markets_path}，价格历史写入 {prices_path}")
+
+    if args.wide_output:
+        wide_path = export_wide_prices(records, price_points, args.wide_output)
+        print(f"宽表已写入 {wide_path}")
 
 
 if __name__ == "__main__":
