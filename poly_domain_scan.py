@@ -28,6 +28,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import re
 import os
 import time
 from dataclasses import dataclass
@@ -88,17 +89,60 @@ def _to_unix(ts: str) -> Optional[int]:
 
 
 def _parse_token_ids(raw: str | Sequence[str] | None) -> List[str]:
+    """解析 clobTokenIds 字段，兼容列表/JSON 字符串/分隔字符串。"""
     if raw is None:
         return []
     if isinstance(raw, str):
+        # 优先尝试 JSON 解析
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, list):
-                return [str(x) for x in parsed]
+                return [str(x).strip() for x in parsed if str(x).strip()]
         except json.JSONDecodeError:
             pass
-        return [raw]
-    return [str(x) for x in raw]
+        # 兼容用 | 或 , 连接的字符串
+        if "|" in raw or "," in raw:
+            return [seg.strip() for seg in re.split(r"[|,]", raw) if seg.strip()]
+        cleaned = raw.strip()
+        return [cleaned] if cleaned else []
+    return [str(x).strip() for x in raw if str(x).strip()]
+
+
+def _normalize_outcomes(raw_outcomes: Sequence[str] | str | None) -> List[str]:
+    """清洗 outcome 字段，兼容字符串/列表输入并移除噪声符号。"""
+
+    if raw_outcomes is None:
+        return []
+
+    # 先将输入标准化为列表
+    if isinstance(raw_outcomes, str):
+        text = raw_outcomes.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                candidates = parsed
+            else:
+                candidates = [text]
+        except json.JSONDecodeError:
+            # 去掉方括号后再尝试按 | 或 , 分割
+            no_brackets = re.sub(r"[\[\]]", "", text)
+            if "|" in no_brackets or "," in no_brackets:
+                candidates = re.split(r"[|,]", no_brackets)
+            else:
+                candidates = [no_brackets]
+    else:
+        candidates = list(raw_outcomes)
+
+    cleaned: List[str] = []
+    for o in candidates:
+        text = str(o or "")
+        # 去除管道、引号与多余空白
+        text = re.sub(r"[\"'|]", "", text).strip()
+        if text:
+            cleaned.append(text)
+    return cleaned
 
 
 class DomainResolver:
@@ -201,17 +245,44 @@ def build_market_records(markets: List[Dict], min_volume: float) -> List[MarketR
         volume = float(mk.get("volume") or mk.get("volume24hr") or 0)
         if volume < min_volume:
             continue
-        outcomes = mk.get("outcomes") or mk.get("shortOutcomes") or []
+
+        market_slug = str(mk.get("slug") or mk.get("marketSlug") or mk.get("market_slug") or "").strip()
+        market_id = str(mk.get("id") or mk.get("_id") or "").strip()
+        if not market_slug:
+            # 用 id 兜底，避免空 slug 导致下游无法关联
+            market_slug = market_id
+
+        outcomes_raw = mk.get("outcomes") or mk.get("shortOutcomes") or []
+        outcomes = _normalize_outcomes(outcomes_raw)
         token_ids = _parse_token_ids(mk.get("clobTokenIds"))
+
+        if not market_slug or not outcomes or not token_ids:
+            print(
+                f"[WARN] 跳过盘口（缺少关键信息）：slug={market_slug!r}, outcomes={outcomes}, tokens={token_ids}"
+            )
+            continue
+
+        # 对齐 outcomes 与 token_ids，长度不一致时裁剪并提示
+        pair_len = min(len(outcomes), len(token_ids))
+        if pair_len == 0:
+            print(f"[WARN] 跳过盘口（outcome/token 对齐失败）：slug={market_slug!r}")
+            continue
+        if len(outcomes) != len(token_ids):
+            print(
+                f"[WARN] outcomes 与 token_ids 长度不一致，将裁剪：slug={market_slug!r}, outcomes={len(outcomes)}, tokens={len(token_ids)}"
+            )
+            outcomes = outcomes[:pair_len]
+            token_ids = token_ids[:pair_len]
+
         records.append(
             MarketRecord(
                 event_slug=str(mk.get("eventSlug") or mk.get("event_slug") or ""),
                 event_question=str(mk.get("eventQuestion") or mk.get("eventTitle") or mk.get("event") or ""),
-                market_id=str(mk.get("id") or mk.get("_id") or ""),
-                market_slug=str(mk.get("slug") or ""),
+                market_id=market_id,
+                market_slug=market_slug,
                 market_question=str(mk.get("question") or mk.get("title") or ""),
                 market_type=str(mk.get("sportsMarketType") or mk.get("marketType") or mk.get("type") or ""),
-                outcomes=[str(o) for o in outcomes],
+                outcomes=outcomes,
                 token_ids=token_ids,
                 created_at=mk.get("createdAt"),
                 closed_time=mk.get("closedTime") or mk.get("endDate"),
@@ -244,10 +315,20 @@ def collect_price_points(record: MarketRecord, fidelity: int) -> List[PricePoint
     start_ts = min(_to_unix(record.created_at) or now_ts - 7 * 86400, now_ts)
     end_ts = min(_to_unix(record.closed_time) or now_ts, now_ts)
     if end_ts <= start_ts:
+        print(f"[WARN] 跳过价格拉取（时间范围异常）：slug={record.market_slug!r}, start={start_ts}, end={end_ts}")
+        return []
+    if not record.market_slug:
+        print(f"[WARN] 跳过价格拉取（缺少 market_slug）")
         return []
     points: List[PricePoint] = []
     for outcome, token_id in zip(record.outcomes, record.token_ids):
+        if not token_id:
+            print(f"[WARN] 跳过 outcome（缺少 token_id）：slug={record.market_slug!r}, outcome={outcome!r}")
+            continue
         history = fetch_price_history(token_id, start_ts, end_ts, fidelity)
+        if not history:
+            print(f"[WARN] 未获取到价格历史：slug={record.market_slug!r}, token={token_id}")
+            continue
         for t, p in history:
             price_prob = p / 10000 if p > 1 else p / 100
             points.append(
