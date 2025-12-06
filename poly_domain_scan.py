@@ -108,11 +108,38 @@ def _parse_token_ids(raw: str | Sequence[str] | None) -> List[str]:
     return [str(x).strip() for x in raw if str(x).strip()]
 
 
-def _normalize_outcomes(outcomes: Sequence[str]) -> List[str]:
-    """清洗 outcome 字段，去除空值和管道分隔符。"""
+def _normalize_outcomes(raw_outcomes: Sequence[str] | str | None) -> List[str]:
+    """清洗 outcome 字段，兼容字符串/列表输入并移除噪声符号。"""
+
+    if raw_outcomes is None:
+        return []
+
+    # 先将输入标准化为列表
+    if isinstance(raw_outcomes, str):
+        text = raw_outcomes.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                candidates = parsed
+            else:
+                candidates = [text]
+        except json.JSONDecodeError:
+            # 去掉方括号后再尝试按 | 或 , 分割
+            no_brackets = re.sub(r"[\[\]]", "", text)
+            if "|" in no_brackets or "," in no_brackets:
+                candidates = re.split(r"[|,]", no_brackets)
+            else:
+                candidates = [no_brackets]
+    else:
+        candidates = list(raw_outcomes)
+
     cleaned: List[str] = []
-    for o in outcomes:
-        text = str(o or "").replace("|", "").strip()
+    for o in candidates:
+        text = str(o or "")
+        # 去除管道、引号与多余空白
+        text = re.sub(r"[\"'|]", "", text).strip()
         if text:
             cleaned.append(text)
     return cleaned
