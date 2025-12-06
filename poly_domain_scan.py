@@ -58,6 +58,7 @@ class MarketRecord:
 @dataclass
 class PricePoint:
     event_slug: str
+    market_id: str
     market_slug: str
     outcome: str
     timestamp: int
@@ -420,6 +421,7 @@ def collect_price_points(
             points.append(
                 PricePoint(
                     event_slug=record.event_slug,
+                    market_id=record.market_id,
                     market_slug=record.market_slug,
                     outcome=outcome,
                     timestamp=t,
@@ -480,6 +482,7 @@ def load_price_points_from_csv(path: str) -> List[PricePoint]:
             points.append(
                 PricePoint(
                     event_slug=row.get("event_slug", ""),
+                    market_id=row.get("market_id", ""),
                     market_slug=row.get("market_slug", ""),
                     outcome=row.get("outcome", ""),
                     timestamp=timestamp,
@@ -573,10 +576,20 @@ def export_csv(records: List[MarketRecord], prices: List[PricePoint], path: str)
 
     with open(prices_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["event_slug", "market_slug", "outcome", "timestamp", "price_raw", "price_prob"])
+        writer.writerow(
+            ["event_slug", "market_id", "market_slug", "outcome", "timestamp", "price_raw", "price_prob"]
+        )
         for pt in prices:
             writer.writerow(
-                [pt.event_slug, pt.market_slug, pt.outcome, pt.timestamp, pt.price_raw, pt.price_prob]
+                [
+                    pt.event_slug,
+                    pt.market_id,
+                    pt.market_slug,
+                    pt.outcome,
+                    pt.timestamp,
+                    pt.price_raw,
+                    pt.price_prob,
+                ]
             )
 
     return markets_path, prices_path
