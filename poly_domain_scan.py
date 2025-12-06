@@ -102,6 +102,8 @@ def _parse_token_ids(raw: str | Sequence[str] | None) -> List[str]:
 
 
 class DomainResolver:
+    GENERIC_SPORT_TAGS = {1, 100639}
+
     def __init__(self, esports_tag_hints: Optional[List[str]] = None) -> None:
         self.esports_tag_hints = esports_tag_hints or []
         self._sports_tags: Dict[str, List[int]] = {}
@@ -150,7 +152,9 @@ class DomainResolver:
             # sports_all 或者指定体育种类
             if sports:
                 for sp in sports:
-                    tag_ids.extend(self._sports_tags.get(sp, []))
+                    ids = self._sports_tags.get(sp, [])
+                    filtered = [t for t in ids if t not in self.GENERIC_SPORT_TAGS]
+                    tag_ids.extend(filtered)
             else:
                 for ids in self._sports_tags.values():
                     tag_ids.extend(ids)
@@ -260,8 +264,13 @@ def collect_price_points(record: MarketRecord, fidelity: int) -> List[PricePoint
     return points
 
 
-def export_csv(records: List[MarketRecord], prices: List[PricePoint], path: str) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as f:
+def export_csv(records: List[MarketRecord], prices: List[PricePoint], path: str) -> Tuple[str, str]:
+    root, ext = os.path.splitext(path)
+    ext = ext or ".csv"
+    markets_path = path
+    prices_path = f"{root}_prices{ext}"
+
+    with open(markets_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(
             [
@@ -296,12 +305,16 @@ def export_csv(records: List[MarketRecord], prices: List[PricePoint], path: str)
                     rec.volume,
                 ]
             )
-        writer.writerow([])
+
+    with open(prices_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
         writer.writerow(["event_slug", "market_slug", "outcome", "timestamp", "price_raw", "price_prob"])
         for pt in prices:
             writer.writerow(
                 [pt.event_slug, pt.market_slug, pt.outcome, pt.timestamp, pt.price_raw, pt.price_prob]
             )
+
+    return markets_path, prices_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -333,7 +346,7 @@ def determine_date_range(args: argparse.Namespace) -> Tuple[dt.datetime, dt.date
         start = _parse_date(args.start_date)
         end = _parse_date(args.end_date)
     else:
-        end = dt.datetime.utcnow()
+        end = dt.datetime.now(dt.UTC)
         start = end - dt.timedelta(days=args.days)
     return start, end
 
@@ -363,8 +376,8 @@ def main() -> None:
     for rec in records:
         price_points.extend(collect_price_points(rec, fidelity=args.fidelity))
 
-    export_csv(records, price_points, args.output)
-    print(f"完成，结果已写入 {args.output}")
+    markets_path, prices_path = export_csv(records, price_points, args.output)
+    print(f"完成，盘口信息写入 {markets_path}，价格历史写入 {prices_path}")
 
 
 if __name__ == "__main__":
