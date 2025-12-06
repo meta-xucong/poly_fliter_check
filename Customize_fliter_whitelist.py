@@ -23,42 +23,26 @@ except Exception as e:
     print("[FATAL] 缺少 requests，请先 pip install requests", file=sys.stderr)
     raise
 
-# ======
-# 全局常量
-# ======
+# ===============================
+# 参数集中区（集中管理默认口径）
+# ===============================
+# 宽口径（通过筛选）与 argparse 默认值的对齐建议：把下面四项与 argparse 默认保持一致
+DEFAULT_MIN_END_HOURS: float = 1.0
+DEFAULT_MAX_END_DAYS: int   = 2
+DEFAULT_GAMMA_WINDOW_DAYS: int = 2
+DEFAULT_GAMMA_MIN_WINDOW_HOURS: int = 1
+DEFAULT_LEGACY_END_DAYS: int  = 730
 
-# Gamma 公共 API
-_GAMMA_HOST = os.environ.get("GAMMA_HOST", "https://gamma-api.polymarket.com")
-# CLOB 公共 REST API（仅 /books）
-_POLY_HOST = os.environ.get("POLY_HOST", "https://clob.polymarket.com").rstrip("/")
-
-# 默认时间窗口：仅抓未来 [2h, 30d] 内结束的市场，按 endDate 分片抓取
-DEFAULT_MIN_END_HOURS = 2.0
-DEFAULT_MAX_END_DAYS = 30
-
-# Gamma 时间切片参数
-DEFAULT_GAMMA_WINDOW_DAYS = 2
-DEFAULT_GAMMA_MIN_WINDOW_HOURS = 1
-
-# 旧格式/归档市场阈值（结束时间早于该值的视为“旧市场”）
-DEFAULT_LEGACY_END_DAYS = 730  # 约 2 年
-
-# 高亮（严格口径）参数默认值
-HIGHLIGHT_MAX_HOURS = 180.0           # 180 小时内（约 7.5 天）
-HIGHLIGHT_ASK_MIN = 0.90              # 卖一价下限
-HIGHLIGHT_ASK_MAX = 0.99              # 卖一价上限
-HIGHLIGHT_MIN_TOTAL_VOLUME = 10000.0  # 总成交量下限（USDC）
-HIGHLIGHT_MAX_ASK_DIFF = 0.10         # 单边点差上限
-
-# REST /books 默认批量大小
-DEFAULT_BOOKS_BATCH_SIZE = 200
-
-# Gamma /markets 每页上限（固定为 500）
-GAMMA_PAGE_LIMIT = 500
+# 高亮（严格口径）集中参数
+HIGHLIGHT_MAX_HOURS: float   = 48.0
+HIGHLIGHT_ASK_MIN: float     = 0.96
+HIGHLIGHT_ASK_MAX: float     = 0.995
+HIGHLIGHT_MIN_TOTAL_VOLUME: float = 10000.0  # 总交易量≥此值（USDC）
+HIGHLIGHT_MAX_ASK_DIFF: float = 0.10         # 同一 token 点差 |ask - bid| ≤ 此阈值（YES 或 NO 任一侧满足即可）
 
 
 # -------------------------------
-# REST-only 客户端加载（非必需，仅用于展示 API key 前缀）
+# （可选）REST 客户端，仅用于打印 API key 前缀（非必需）
 # -------------------------------
 
 def _import_rest_client():
@@ -67,92 +51,58 @@ def _import_rest_client():
         return _get_client
     except Exception as e:
         print(f"[WARN] 无法加载 REST 客户端：{e}", file=sys.stderr)
-
         def _noop():
             return None
-
         return _noop
-
 
 get_rest_client = _import_rest_client()
 
-
-# ======
-# 数据结构
-# ======
-
-@dataclass
-class OutcomeSnapshot:
-    token_id: str
-    side: str  # "YES" / "NO"
-    bid: Optional[float] = None
-    ask: Optional[float] = None
-
-
-@dataclass
-class OrderbookSide:
-    bid: Optional[float] = None
-    ask: Optional[float] = None
-
-
-@dataclass
-class MarketSnapshot:
-    id: str
-    slug: str
-    title: str
-    end_time: dt.datetime
-    active: bool
-    resolved: bool
-    closed: bool
-    acceptingOrders: bool
-    liquidity: Optional[float]
-    totalVolume: Optional[float]
-    tags: List[str] = field(default_factory=list)
-    outcomes: List[OutcomeSnapshot] = field(default_factory=list)
-    yes: OrderbookSide = field(default_factory=OrderbookSide)
-    no: OrderbookSide = field(default_factory=OrderbookSide)
-    raw: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class FilterResult:
-    """用于 collect_filter_results 的结构化输出。"""
-    markets: List[MarketSnapshot]
-    early_rejects: List[Tuple[MarketSnapshot, str]]
-    highlights: List[Tuple[MarketSnapshot, OutcomeSnapshot, float]]
-
-
-# ======
-# 工具函数
-# ======
+# -------------------------------
+# 小工具
+# -------------------------------
 
 def _now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
-
-def _parse_iso8601(s: str) -> Optional[dt.datetime]:
+def _parse_dt(s: Optional[str]) -> Optional[dt.datetime]:
     if not s:
         return None
     try:
-        # Gamma 使用 ISO8601 带 'Z'
-        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if s.endswith('Z'):
+            s = s[:-1] + '+00:00'
+        return dt.datetime.fromisoformat(s)
     except Exception:
         return None
 
+def _coerce_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, str):
+            x2 = x.replace(',', '').strip()
+            if x2 == '':
+                return None
+            return float(x2)
+    except Exception:
+        return None
+    return None
 
-def _as_bool(x: Any) -> Optional[bool]:
+def _coerce_bool(x: Any) -> Optional[bool]:
+    if x is None:
+        return None
     if isinstance(x, bool):
         return x
     if isinstance(x, str):
         s = x.strip().lower()
-        if s in ("true", "yes", "y", "1"):
+        if s in ('true', 'yes', 'y', '1'):
             return True
-        if s in ("false", "no", "n", "0"):
+        if s in ('false', 'no', 'n', '0'):
             return False
     if isinstance(x, (int, float)):
         return bool(x)
     return None
-
 
 def _fmt_money(x: Optional[float]) -> str:
     if x is None:
@@ -162,375 +112,329 @@ def _fmt_money(x: Optional[float]) -> str:
     except Exception:
         return str(x)
 
-
 def _hours_until(t: Optional[dt.datetime]) -> Optional[float]:
-    if t is None:
+    if not t:
         return None
-    now = _now_utc()
-    try:
-        delta = t - now
-        return delta.total_seconds() / 3600.0
-    except Exception:
-        return None
+    delta = (t - _now_utc()).total_seconds() / 3600.0
+    return round(delta, 1)
+
+def _infer_binary_from_raw(raw: Dict[str, Any]) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    op = raw.get("outcomePrices")
+    if isinstance(op, list) and len(op) == 2:
+        return True
+    for k in ("outcomes", "contracts"):
+        v = raw.get(k)
+        if isinstance(v, list) and len(v) == 2:
+            return True
+    for k in ("binary", "isBinary"):
+        bv = raw.get(k)
+        if isinstance(bv, bool) and bv:
+            return True
+        if isinstance(bv, str) and bv.lower() in ("true","yes","y","1"):
+            return True
+    return False
+
+# -------------------------------
+# 数据结构
+# -------------------------------
+
+@dataclass
+class OutcomeSnapshot:
+    name: str
+    token_id: Optional[str] = None
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    last: Optional[float] = None
 
 
-def _fmt_hours_left(t: Optional[dt.datetime]) -> str:
-    h = _hours_until(t)
-    if h is None:
-        return "-"
-    return f"{h:.1f}"
+@dataclass
+class MarketSnapshot:
+    slug: str
+    title: str
+    raw: Dict[str, Any] = field(default_factory=dict)
+    yes: OutcomeSnapshot = field(default_factory=lambda: OutcomeSnapshot(name='YES'))
+    no: OutcomeSnapshot = field(default_factory=lambda: OutcomeSnapshot(name='NO'))
+    liquidity: Optional[float] = None
+    volume24h: Optional[float] = None
+    totalVolume: Optional[float] = None
+    tags: List[str] = field(default_factory=list)
+    active: Optional[bool] = None
+    closed: Optional[bool] = None
+    resolved: Optional[bool] = None
+    acceptingOrders: Optional[bool] = None
+    end_time: Optional[dt.datetime] = None
 
 
-def _safe_float(x: Any) -> Optional[float]:
-    if x is None or x == "":
-        return None
-    try:
-        return float(x)
-    except Exception:
-        return None
+@dataclass
+class HighlightedOutcome:
+    """被严格筛选条件命中的市场-方向组合。"""
+
+    market: MarketSnapshot
+    outcome: OutcomeSnapshot
+    hours_to_end: float
 
 
-# ======
-# Gamma /markets 抓取（带时间切片）
-# ======
+@dataclass
+class FilterResult:
+    """封装供自动化脚本复用的筛选结果。"""
 
-def fetch_markets_page(end_min: dt.datetime,
-                       end_max: dt.datetime,
-                       cursor: Optional[str] = None) -> Dict[str, Any]:
-    """调用 Gamma /markets 一页，带时间过滤和 cursor。"""
-    params = {
-        "limit": GAMMA_PAGE_LIMIT,
-        "endDateMin": end_min.isoformat().replace("+00:00", "Z"),
-        "endDateMax": end_max.isoformat().replace("+00:00", "Z"),
-    }
-    if cursor:
-        params["cursor"] = cursor
+    total_markets: int
+    candidates: List[MarketSnapshot]
+    chosen: List[MarketSnapshot]
+    rejected: List[Tuple[MarketSnapshot, str]]
+    highlights: List[HighlightedOutcome]
+
+# -------------------------------
+# Gamma 抓取（时间切片 · 突破500）
+# -------------------------------
+
+_GAMMA_HOST = os.environ.get("GAMMA_HOST", "https://gamma-api.polymarket.com")
+
+def _gamma_fetch(params: Dict[str, str]) -> List[Dict[str, Any]]:
     url = f"{_GAMMA_HOST}/markets"
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and "data" in data:
+            return data["data"]
+        return []
+    except Exception:
+        return []
 
+def fetch_markets_windowed(
+    end_min: dt.datetime,
+    end_max: dt.datetime,
+    *,
+    window_days: int = 14,
+    min_window_hours: int = DEFAULT_GAMMA_MIN_WINDOW_HOURS,
+) -> List[Dict[str, Any]]:
+    all_mkts: List[Dict[str, Any]] = []
+    seen: set = set()
+    one_sec = dt.timedelta(seconds=1)
+    min_window = dt.timedelta(hours=max(1, int(min_window_hours)))
 
-def fetch_markets_windowed(end_min: dt.datetime,
-                           end_max: dt.datetime,
-                           *,
-                           window_days: int = DEFAULT_GAMMA_WINDOW_DAYS,
-                           min_window_hours: int = DEFAULT_GAMMA_MIN_WINDOW_HOURS) -> List[Dict[str, Any]]:
-    """
-    按 endDate 时间窗口递归抓取，避免单次命中 500 上限。
-    - 初始窗口大小 = window_days
-    - 若某窗口命中 500 条，则将该窗口继续二分，直到窗口 < min_window_hours 仍命中 500，则退化到按 endDate 再分页（cursor）
-    """
-    results: List[Dict[str, Any]] = []
+    def _process_interval(start: dt.datetime, end: dt.datetime) -> None:
+        params = {
+            "limit": "500",
+            "order": "endDate",
+            "ascending": "true",
+            "active": "true",
+            "closed": "false",
+            "end_date_min": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_date_max": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        chunk = _gamma_fetch(params)
 
-    def _extract(payload: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-        """提取 markets 列表和 cursor，兼容 list / dict 返回值。"""
-        if isinstance(payload, list):
-            return payload, None
-        if isinstance(payload, dict):
-            mkts = payload.get("data") or payload.get("markets") or []
-            cursor = payload.get("nextCursor") or payload.get("cursor")
-            return mkts, cursor
-        return [], None
+        for m in chunk:
+            mid = m.get("id") or m.get("slug")
+            if mid and mid not in seen:
+                seen.add(mid)
+                all_mkts.append(m)
 
-    def _split_window(start: dt.datetime, stop: dt.datetime):
-        # 若窗口结束时间早于最小开始时间，跳过
-        if stop <= start:
-            return
-        span_hours = (stop - start).total_seconds() / 3600.0
-        if span_hours <= min_window_hours:
-            # 已小于最小窗口：直接按 cursor 分页抓取
-            cursor: Optional[str] = None
-            while True:
-                try:
-                    data = fetch_markets_page(start, stop, cursor)
-                except Exception as e:
-                    print(f"[WARN] fetch_markets_page 失败：{e}", file=sys.stderr)
-                    break
-                mkts, cursor = _extract(data)
-                results.extend(mkts)
-                if not cursor or len(mkts) < GAMMA_PAGE_LIMIT:
-                    break
+        if not chunk:
             return
 
-        # 尝试以当前窗口抓一次
+        duration = end - start
+        hit_limit = len(chunk) >= 500
+
+        if hit_limit and duration > min_window:
+            mid_point = start + dt.timedelta(seconds=duration.total_seconds() / 2)
+            left_end = min(mid_point, end)
+            right_start = left_end + one_sec
+            if start < left_end:
+                _process_interval(start, left_end)
+            if right_start <= end:
+                _process_interval(right_start, end)
+            return
+
+        if hit_limit:
+            last_end = _parse_dt(chunk[-1].get("endDate") or chunk[-1].get("end_time") or chunk[-1].get("endTime"))
+            if last_end is not None:
+                next_start = last_end + one_sec
+                if next_start <= end:
+                    _process_interval(next_start, end)
+
+    cur = end_min
+    while cur <= end_max:
+        sub_end = min(cur + dt.timedelta(days=window_days), end_max)
+        _process_interval(cur, sub_end)
+        cur = sub_end + one_sec
+
+    return all_mkts
+
+# -------------------------------
+# 解析 + 旧格式检测
+# -------------------------------
+
+def _is_arch_legacy_nonclob(raw: Dict[str, Any], legacy_end_days: int) -> bool:
+    title = (raw.get("question") or raw.get("title") or "").strip()
+    slug  = (raw.get("slug") or "").strip()
+    end   = _parse_dt(raw.get("endDate") or raw.get("end_time") or raw.get("endTime"))
+    clob_ids = raw.get("clobTokenIds") or raw.get("clob_token_ids") or raw.get("clobTokens")
+
+    if title.upper().startswith("ARCH") or slug.lower().startswith("arch"):
+        return True
+    if not clob_ids:
+        return True
+    if end is not None and legacy_end_days and legacy_end_days > 0:
         try:
-            data = fetch_markets_page(start, stop, None)
-        except Exception as e:
-            print(f"[WARN] fetch_markets_page（window）失败：{e}", file=sys.stderr)
-            return
-        mkts, cursor = _extract(data)
-        if len(mkts) >= GAMMA_PAGE_LIMIT:
-            # 命中上限：继续二分
-            mid = start + dt.timedelta(hours=span_hours / 2.0)
-            _split_window(start, mid)
-            _split_window(mid, stop)
-        else:
-            # 未命中上限，可按 cursor 继续抓完
-            results.extend(mkts)
-            while cursor:
-                try:
-                    data2 = fetch_markets_page(start, stop, cursor)
-                except Exception as e:
-                    print(f"[WARN] fetch_markets_page（cursor）失败：{e}", file=sys.stderr)
-                    break
-                mkts2, cursor = _extract(data2)
-                results.extend(mkts2)
-                if not cursor or len(mkts2) < GAMMA_PAGE_LIMIT:
-                    break
-
-    _split_window(end_min, end_max)
-    return results
-
-
-# ======
-# 解析 Gamma 市场数据
-# ======
+            hours = _hours_until(end)
+            if hours is not None and hours < -24.0 * float(legacy_end_days):
+                return True
+        except Exception:
+            pass
+    return False
 
 def _parse_market(raw: Dict[str, Any]) -> MarketSnapshot:
-    mid = str(raw.get("id") or raw.get("_id") or "")
-    slug = str(raw.get("slug") or "")
-    title = str(raw.get("question") or raw.get("title") or slug or mid)
-    end_time = _parse_iso8601(raw.get("endDate") or raw.get("endTime") or "")
+    title = raw.get("question") or raw.get("title") or ""
+    slug  = raw.get("slug") or ""
+    ms = MarketSnapshot(slug=slug, title=title, raw=raw)
 
-    active = bool(_as_bool(raw.get("active")))
-    resolved = bool(_as_bool(raw.get("resolved")))
-    closed = bool(_as_bool(raw.get("closed")))
-    accepting = bool(_as_bool(raw.get("acceptingOrders") or raw.get("accepting")))
+    ms.active = _coerce_bool(raw.get("active"))
+    ms.closed = _coerce_bool(raw.get("closed"))
+    ms.resolved = _coerce_bool(raw.get("resolved"))
+    ms.acceptingOrders = _coerce_bool(raw.get("acceptingOrders"))
+    ms.end_time = _parse_dt(raw.get("endDate") or raw.get("end_time") or raw.get("endTime"))
 
-    liquidity = _safe_float(raw.get("liquidity"))
-    total_volume = _safe_float(raw.get("totalVolume") or raw.get("volume"))
+    ms.liquidity = _coerce_float(raw.get("liquidity") or raw.get("liquidity_num") or raw.get("liquidityNum") or raw.get("liquidityUsd") or raw.get("totalLiquidity"))
+    ms.volume24h = _coerce_float(raw.get("volume24h") or raw.get("volume24Hr") or raw.get("volume24Hour") or raw.get("volume_24h") or raw.get("lastDayVolume"))
+    ms.totalVolume = _coerce_float(raw.get("totalVolume") or raw.get("volume") or raw.get("volume_num") or raw.get("volumeNum"))
 
-    tags = raw.get("tags") or []
-    if not isinstance(tags, list):
-        tags = []
+    tags = raw.get("tags") or raw.get("tagNames") or raw.get("categories") or []
+    if isinstance(tags, list):
+        ms.tags = [str(t) for t in tags]
+    elif isinstance(tags, str):
+        ms.tags = [tags]
 
-    outcomes_raw = raw.get("outcomes") or raw.get("markets") or []
-    outcomes: List[OutcomeSnapshot] = []
-    yes_side = OrderbookSide()
-    no_side = OrderbookSide()
+    clob_ids = raw.get("clobTokenIds") or raw.get("clob_token_ids") or raw.get("clobTokens")
+    if isinstance(clob_ids, str):
+        try:
+            import json as _json
+            clob_ids = _json.loads(clob_ids)
+        except Exception:
+            clob_ids = None
+    if isinstance(clob_ids, list) and len(clob_ids) >= 2:
+        try:
+            ms.yes.token_id = str(clob_ids[0])
+            ms.no.token_id  = str(clob_ids[1])
+        except Exception:
+            pass
 
-    # 支持多种 outcome 结构，但这里只关心 YES/NO token_id / prices
-    for o in outcomes_raw:
-        token_id = str(o.get("tokenId") or o.get("id") or "")
-        # side 可以是 YES/NO，也可能是 YES_TOKEN/NO_TOKEN 等，这里做一个兼容
-        side_raw = str(o.get("side") or o.get("type") or "").upper()
-        side = "YES" if "YES" in side_raw else "NO" if "NO" in side_raw else side_raw
-        bid = _safe_float(o.get("bestBid"))
-        ask = _safe_float(o.get("bestAsk"))
-        snap = OutcomeSnapshot(token_id=token_id, side=side, bid=bid, ask=ask)
-        outcomes.append(snap)
-        if side == "YES":
-            if bid is not None:
-                yes_side.bid = bid if yes_side.bid is None else max(yes_side.bid, bid)
-            if ask is not None:
-                yes_side.ask = ask if yes_side.ask is None else min(yes_side.ask, ask)
-        elif side == "NO":
-            if bid is not None:
-                no_side.bid = bid if no_side.bid is None else max(no_side.bid, bid)
-            if ask is not None:
-                no_side.ask = ask if no_side.ask is None else min(no_side.ask, ask)
+    return ms
 
-    return MarketSnapshot(
-        id=mid,
-        slug=slug,
-        title=title,
-        end_time=end_time,
-        active=active,
-        resolved=resolved,
-        closed=closed,
-        acceptingOrders=accepting,
-        liquidity=liquidity,
-        totalVolume=total_volume,
-        tags=tags,
-        outcomes=outcomes,
-        yes=yes_side,
-        no=no_side,
-        raw=raw,
-    )
+# -------------------------------
+# 早筛（不拉价格，先确定是否需要回补）
+# -------------------------------
 
+def _is_binary(ms: MarketSnapshot) -> bool:
+    return bool(ms.yes.token_id and ms.no.token_id)
 
-# ======
-# REST /books 回补买一/卖一（bestBid/bestAsk）
-# ======
+def _early_filter_reason(ms: MarketSnapshot, min_end_hours: float, legacy_end_days: int) -> Tuple[bool, str]:
+    if _is_arch_legacy_nonclob(ms.raw, legacy_end_days):
+        if not _is_binary(ms) and _infer_binary_from_raw(ms.raw):
+            return False, "二元（旧格式；缺 clobTokenIds）"
+        return False, "归档/旧格式（非 CLOB）"
+    if not _is_binary(ms):
+        if _infer_binary_from_raw(ms.raw):
+            return False, "二元（旧格式；缺 clobTokenIds）"
+        return False, "非二元市场"
+    if min_end_hours is not None and min_end_hours > 0:
+        h = _hours_until(ms.end_time)
+        if h is None or h < min_end_hours:
+            return False, f"剩余时间不足（{h}h）"
+    return True, "候选（待回补报价）"
 
-def fetch_books_batch(token_ids: List[str]) -> Dict[str, Dict[str, Any]]:
-    """
-    调用 /books?ids=... 获取若干 token 的订单簿最佳价：
-    返回结构：{tokenId: {"yes": {"bids":[...], "asks":[...]}, "no": {...}}}
-    """
-    if not token_ids:
-        return {}
-    url = f"{_POLY_HOST}/books"
-    params = [("ids", tid) for tid in token_ids]
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json() or {}
-    if isinstance(data, list):
-        # 历史遗留：/books 早期可能是 list，这里兼容一下
-        d2: Dict[str, Dict[str, Any]] = {}
-        for item in data:
-            tid = str(item.get("id") or item.get("tokenId") or "")
-            if tid:
-                d2[tid] = item
-        return d2
-    return data
+# -------------------------------
+# REST /books 批量回补（直接取买一/卖一）
+# -------------------------------
 
+_POLY_HOST = os.environ.get("POLY_HOST", "https://clob.polymarket.com").rstrip("/")
 
-def _extract_best_from_book(book: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    """
-    从 book["bids"], book["asks"] 中提取最佳买价/卖价（price 最大买价、最小卖价）。
-    允许 bids/asks 为 None 或空列表。
-    """
-    best_bid = None
-    best_ask = None
-    bids = book.get("bids") or []
-    asks = book.get("asks") or []
-    if isinstance(bids, list):
-        for b in bids:
-            p = _safe_float(b.get("price"))
-            if p is not None:
-                best_bid = p if best_bid is None else max(best_bid, p)
-    if isinstance(asks, list):
-        for a in asks:
-            p = _safe_float(a.get("price"))
-            if p is not None:
-                best_ask = p if best_ask is None else min(best_ask, p)
-    return best_bid, best_ask
+def _rest_books_backfill(candidates: List[MarketSnapshot], batch_size: int = 200, timeout: float = 10.0) -> None:
+    # 仅对仍缺买卖价的 token 做回补（任一侧有价即可跳过）
+    missing: List[str] = []
+    index: Dict[str, Tuple[MarketSnapshot, str]] = {}
+    seen = set()
 
+    for ms in candidates:
+        for side, snap in (('YES', ms.yes), ('NO', ms.no)):
+            tid = snap.token_id
+            if not tid:
+                continue
+            if (snap.bid is None and snap.ask is None) and tid not in seen:
+                seen.add(tid)
+                missing.append(tid)
+                index[tid] = (ms, side)
 
-def _rest_books_backfill(markets: List[MarketSnapshot],
-                         batch_size: int = DEFAULT_BOOKS_BATCH_SIZE) -> None:
-    """
-    对传入的 markets，根据其 outcomes 中缺失的 bid/ask 信息，通过 /books 批量回补。
-    只更新 YES/NO 的 bestBid/bestAsk。
-    """
-    # 收集所有 token_id
-    token_ids: List[str] = []
-    for ms in markets:
-        for o in ms.outcomes:
-            if o.token_id:
-                token_ids.append(o.token_id)
-    # 去重
-    token_ids = sorted(set(token_ids))
-    if not token_ids:
+    if not missing:
         return
 
-    print(f"[TRACE] REST 回补：共 {len(token_ids)} 个 token_id，批量大小={batch_size}")
+    url = f"{_POLY_HOST}/books"
+    headers = {"Content-Type": "application/json"}
 
-    # 分批拉取 /books
-    books_all: Dict[str, Dict[str, Any]] = {}
-    for i in range(0, len(token_ids), batch_size):
-        batch = token_ids[i:i + batch_size]
+    def best_from_levels(levels: List[Dict[str, Any]], is_bid: bool) -> Optional[float]:
+        if not isinstance(levels, list) or not levels:
+            return None
+        prices = []
+        for lv in levels:
+            p = _coerce_float((lv or {}).get("price"))
+            if p is not None:
+                prices.append(p)
+        if not prices:
+            return None
+        return (max(prices) if is_bid else min(prices))
+
+    for i in range(0, len(missing), batch_size):
+        batch = missing[i:i+batch_size]
+        body = [{"token_id": tid} for tid in batch]
         try:
-            books = fetch_books_batch(batch)
+            r = requests.post(url, json=body, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
         except Exception as e:
-            print(f"[WARN] fetch_books_batch 失败：{e}", file=sys.stderr)
+            print(f"[WARN] REST /books 回补失败：{e}", file=sys.stderr)
             continue
-        books_all.update(books)
 
-    # 回补到 MarketSnapshot
-    for ms in markets:
-        for o in ms.outcomes:
-            if not o.token_id:
-                continue
-            b = books_all.get(o.token_id)
-            if not b:
-                continue
-            # 根据 side 区分 yes/no
-            side_raw = str(b.get("side") or b.get("type") or "").upper()
-            side = "YES" if "YES" in side_raw else "NO" if "NO" in side_raw else side_raw
-
-            # 兼容结构：有的返回 {"yes": {...}, "no": {...}}，有的直接是 {"bids":[...], "asks":[...]}
-            if "yes" in b or "no" in b:
-                if side == "YES":
-                    node = b.get("yes") or {}
-                elif side == "NO":
-                    node = b.get("no") or {}
+        if not isinstance(data, list):
+            continue
+        for ob in data:
+            try:
+                tid = str(ob.get("asset_id") or ob.get("token_id") or "")
+                if not tid or tid not in index:
+                    continue
+                ms, side = index[tid]
+                bids = ob.get("bids") or []
+                asks = ob.get("asks") or []
+                bb = best_from_levels(bids, is_bid=True)
+                aa = best_from_levels(asks, is_bid=False)
+                if side == 'YES':
+                    if ms.yes.bid is None and bb is not None: ms.yes.bid = bb
+                    if ms.yes.ask is None and aa is not None: ms.yes.ask = aa
                 else:
-                    node = b.get("yes") or b.get("no") or {}
-            else:
-                node = b
+                    if ms.no.bid is None and bb is not None: ms.no.bid = bb
+                    if ms.no.ask is None and aa is not None: ms.no.ask = aa
+            except Exception:
+                continue
 
-            best_bid, best_ask = _extract_best_from_book(node)
+# -------------------------------
+# 最终筛选（在回补后判断报价）
+# -------------------------------
 
-            # 更新 outcome
-            if best_bid is not None:
-                o.bid = best_bid
-            if best_ask is not None:
-                o.ask = best_ask
-
-            # 同步到 YES/NO 汇总
-            if o.side == "YES":
-                if best_bid is not None:
-                    ms.yes.bid = best_bid if ms.yes.bid is None else max(ms.yes.bid, best_bid)
-                if best_ask is not None:
-                    ms.yes.ask = best_ask if ms.yes.ask is None else min(ms.yes.ask, best_ask)
-            elif o.side == "NO":
-                if best_bid is not None:
-                    ms.no.bid = best_bid if ms.no.bid is None else max(ms.no.bid, best_bid)
-                if best_ask is not None:
-                    ms.no.ask = best_ask if ms.no.ask is None else min(ms.no.ask, best_ask)
-
-
-# ======
-# 早筛逻辑（仅看 endDate / active / resolved 等元信息）
-# ======
-
-def _early_filter_reason(ms: MarketSnapshot,
-                         min_end_hours: float,
-                         legacy_end_days: int) -> Tuple[bool, str]:
-    """
-    返回 (是否通过, 理由)。不看价格，仅根据元数据做早期过滤：
-    - 必须 active=True
-    - 不允许 resolved=True
-    - 不允许 closed=True
-    - end_time 在未来 min_end_hours 之后
-    - end_time 不早于 NOW - legacy_end_days
-    """
-    if not ms.active:
-        return False, "非 active"
-    if ms.resolved:
-        return False, "已 resolved"
-    if ms.closed:
-        return False, "已 closed"
-    if ms.end_time is None:
-        return False, "无 end_time"
-    h = _hours_until(ms.end_time)
-    if h is None:
-        return False, "无法计算剩余时间"
-    if h < min_end_hours:
-        return False, f"剩余时间 {h:.1f}h < {min_end_hours}h"
-    # 旧格式/归档：结束时间太久远
-    now = _now_utc()
-    if ms.end_time < now - dt.timedelta(days=legacy_end_days):
-        return False, "旧市场/归档"
-    # 对订单簿的最低要求在后续统一检查
+def _final_pass_reason(ms: MarketSnapshot, require_quotes: bool) -> Tuple[bool, str]:
+    if require_quotes:
+        yes_ok = (ms.yes.bid is not None or ms.yes.ask is not None)
+        no_ok  = (ms.no.bid is not None or ms.no.ask is not None)
+        if not (yes_ok or no_ok):
+            return False, "缺少买卖价（空簿/超时）"
     return True, "OK"
 
-
-def _satisfy_basic_liquidity(ms: MarketSnapshot, allow_illiquid: bool = False) -> Tuple[bool, str]:
-    """
-    基础流动性/价格可用性检查：
-    - 若 allow_illiquid=False：
-      - 要求 YES/NO 中至少一边有 bid 或 ask
-    """
-    if allow_illiquid:
-        return True, "允许无流动性"
-    # 至少一边有报价
-    yes_ok = (ms.yes.bid is not None or ms.yes.ask is not None)
-    no_ok = (ms.no.bid is not None or ms.no.ask is not None)
-    if not (yes_ok or no_ok):
-        return False, "缺少买卖价（空簿/超时）"
-    return True, "OK"
-
-
 # -------------------------------
-# 打印
-# -------------------------------
-
-# -------------------------------
-# 关键词白名单（仅保留包含以下词条的话题）
+# 白名单（仅保留命中词条的话题）
 # -------------------------------
 
 WHITELIST_TERMS = [
@@ -544,7 +448,6 @@ WHITELIST_TERMS = [
     "Will Elon Musk post","dota2","a dozen eggs",
 ]
 
-
 def _build_whitelist_patterns(terms: Iterable[str]) -> List[Tuple[str, re.Pattern[str]]]:
     patterns: List[Tuple[str, re.Pattern[str]]] = []
     for term in terms:
@@ -556,22 +459,7 @@ def _build_whitelist_patterns(terms: Iterable[str]) -> List[Tuple[str, re.Patter
         patterns.append((term, pat))
     return patterns
 
-
 WHITELIST_PATTERNS = _build_whitelist_patterns(WHITELIST_TERMS)
-
-
-def _whitelist_match(ms: MarketSnapshot) -> Optional[str]:
-    """返回命中的白名单词条；若白名单为空则返回 None（不启用过滤）。"""
-    if not WHITELIST_PATTERNS:
-        return None
-    parts = [ms.title or "", ms.slug or ""]
-    if ms.tags:
-        parts.append(" ".join(ms.tags))
-    haystack = " ".join(filter(None, parts))
-    for term, pat in WHITELIST_PATTERNS:
-        if pat.search(haystack):
-            return term
-    return None
 
 
 def _print_snapshot(idx: int, total: int, ms: MarketSnapshot):
@@ -583,21 +471,41 @@ def _print_snapshot(idx: int, total: int, ms: MarketSnapshot):
         f"acceptingOrders={'是' if ms.acceptingOrders else '-'}",
     ])
     print(f"[TRACE]   状态：{st}")
-    print(f"[TRACE]   金额：liquidity={_fmt_money(ms.liquidity)} totalVolume={_fmt_money(ms.totalVolume)}")
-    print(f"[TRACE]   时间：end_time={ms.end_time} (剩余 { _fmt_hours_left(ms.end_time)}h )")
-    if ms.tags:
-        print(f"[TRACE]   标签：{', '.join(ms.tags)}")
-    print(f"[TRACE]   YES: bid={ms.yes.bid} ask={ms.yes.ask}")
-    print(f"[TRACE]   NO : bid={ms.no.bid} ask={ms.no.ask}")
-
+    print(f"[TRACE]   金额：liquidity={_fmt_money(ms.liquidity)} volume24h={_fmt_money(ms.volume24h)} totalVolume={_fmt_money(ms.totalVolume)}")
+    raw_end = ms.end_time.isoformat() if ms.end_time else "-"
+    print(f"[TRACE]   时间：raw_end={raw_end}")
+    print(f"[TRACE]   解析结果：")
+    print(f"[TRACE]     {ms.slug} | {ms.title}")
+    if (ms.yes.token_id is None or ms.no.token_id is None):
+        print(f"[TRACE]       [HINT] 未能解析 clobTokenIds（疑似旧格式）。")
+    def _fmt_side(s: OutcomeSnapshot) -> str:
+        b = "-" if s.bid is None else f"{s.bid:.4f}"
+        a = "-" if s.ask is None else f"{s.ask:.4f}"
+        return f"{s.name}[{s.token_id}] bid={b} ask={a}"
+    print(f"[TRACE]       {_fmt_side(ms.yes)}")
+    print(f"[TRACE]       {_fmt_side(ms.no)}")
+    h = _hours_until(ms.end_time)
+    print(f"[TRACE]       liquidity={_fmt_money(ms.liquidity)}  volume24h={_fmt_money(ms.volume24h)}  ends_in={h}h  tags={','.join(ms.tags) if ms.tags else '-'}")
 
 def _print_singleline(ms: MarketSnapshot, reason: str):
-    h = _fmt_hours_left(ms.end_time)
-    yb = f"{ms.yes.bid:.3f}" if ms.yes.bid is not None else "-"
-    ya = f"{ms.yes.ask:.3f}" if ms.yes.ask is not None else "-"
-    nb = f"{ms.no.bid:.3f}" if ms.no.bid is not None else "-"
-    na = f"{ms.no.ask:.3f}" if ms.no.ask is not None else "-"
-    print(f"[RESULT] {ms.slug} | {ms.title} | YES {yb}/{ya} NO {nb}/{na} | ends_in={h}h | {reason}", flush=True)
+    yb = "-" if ms.yes.bid is None else f"{ms.yes.bid:.4f}"
+    ya = "-" if ms.yes.ask is None else f"{ms.yes.ask:.4f}"
+    nb = "-" if ms.no.bid is None else f"{ms.no.bid:.4f}"
+    na = "-" if ms.no.ask is None else f"{ms.no.ask:.4f}"
+    h  = _hours_until(ms.end_time)
+    print(f"[RES] {ms.slug} | {ms.title} | YES {yb}/{ya} NO {nb}/{na} | ends_in={h}h | {reason}", flush=True)
+
+
+def _whitelist_match(ms: MarketSnapshot) -> Optional[str]:
+    parts = [ms.title or "", ms.slug or ""]
+    if ms.tags:
+        parts.append(" ".join(ms.tags))
+    haystack = " ".join(filter(None, parts))
+    for term, pat in WHITELIST_PATTERNS:
+        if pat.search(haystack):
+            return term
+    return None
+
 
 
 def _highlight_outcomes(ms: MarketSnapshot,
@@ -612,7 +520,7 @@ def _highlight_outcomes(ms: MarketSnapshot,
     - 卖一价 ask ∈ [ask_min, ask_max]（默认 HIGHLIGHT_ASK_MIN/HIGHLIGHT_ASK_MAX）
     - 总交易量 totalVolume ≥ min_total_volume（默认 HIGHLIGHT_MIN_TOTAL_VOLUME）
     - 同一 token 的点差 |ask - bid| ≤ max_ask_diff（YES 或 NO 任一满足即可；默认 HIGHLIGHT_MAX_ASK_DIFF）
-    - 若配置了白名单：仅保留命中白名单词条的市场
+    - 命中白名单（若配置了白名单）
     """
     mh = HIGHLIGHT_MAX_HOURS if max_hours is None else max_hours
     lo = HIGHLIGHT_ASK_MIN if ask_min is None else ask_min
@@ -623,8 +531,6 @@ def _highlight_outcomes(ms: MarketSnapshot,
     hours = _hours_until(ms.end_time)
     if hours is None or hours < 0 or hours > mh:
         return []
-
-    # 若配置了白名单：仅保留命中白名单词条的市场
     if WHITELIST_PATTERNS and _whitelist_match(ms) is None:
         return []
 
@@ -639,38 +545,14 @@ def _highlight_outcomes(ms: MarketSnapshot,
         return []
 
     # 单边点差（同一 token 内 ask-bid）约束在逐项判定中完成
-    highlights: List[Tuple[OutcomeSnapshot, float]] = []
-    for o in ms.outcomes:
-        if o.ask is None:
-            continue
-        if not (lo <= o.ask <= hi):
-            continue
-        # 计算对应 side 的 bid
-        if o.side == "YES":
-            bid = ms.yes.bid
-        elif o.side == "NO":
-            bid = ms.no.bid
-        else:
-            bid = o.bid
-        if bid is None:
-            continue
-        if abs(o.ask - bid) > mdiff:
-            continue
-        hours2 = _hours_until(ms.end_time) or 0.0
-        highlights.append((o, hours2))
-    return highlights
 
-
-def _print_highlighted(highlights: List[Tuple[MarketSnapshot, OutcomeSnapshot, float]]):
-    if not highlights:
-        print("[HIGHLIGHT] 当前无满足高亮条件的市场。")
-        return
-    print("[HIGHLIGHT] 满足高亮条件的市场：")
-    label = _highlight_label()
-    print(f"  条件：{label}")
-    for ms, snap, hours in highlights:
-        print(f"  - slug={ms.slug} | 标题={ms.title}")
-        print(f"      side={snap.side} token_id={snap.token_id} bid={snap.bid} ask={snap.ask} | 剩余 {hours:.1f}h")
+    matches: List[Tuple[OutcomeSnapshot, float]] = []
+    for snap in (ms.yes, ms.no):
+        ask_ok = (snap.ask is not None and lo <= snap.ask <= hi)
+        spread_ok = (snap.bid is not None and snap.ask is not None and abs(float(snap.ask) - float(snap.bid)) <= mdiff)
+        if ask_ok and spread_ok:
+            matches.append((snap, hours))
+    return matches
 
 
 def _highlight_label() -> str:
@@ -725,7 +607,6 @@ def collect_filter_results(
         if only_pat and (only_pat not in title.lower() and only_pat not in slug.lower()):
             continue
         ms = _parse_market(raw)
-        # 白名单过滤：若配置了白名单，则仅保留命中的市场
         if WHITELIST_PATTERNS and _whitelist_match(ms) is None:
             early_rejects.append((ms, "未命中白名单"))
             continue
@@ -739,21 +620,47 @@ def collect_filter_results(
         _rest_books_backfill(market_list, batch_size=books_batch_size)
 
     chosen: List[MarketSnapshot] = []
-    highlights: List[Tuple[MarketSnapshot, OutcomeSnapshot, float]] = []
+    rejects: List[Tuple[MarketSnapshot, str]] = early_rejects.copy()
     for ms in market_list:
-        ok, reason = _satisfy_basic_liquidity(ms, allow_illiquid=allow_illiquid)
-        if not ok:
-            early_rejects.append((ms, reason))
-            continue
-        chosen.append(ms)
-        for snap, hours in _highlight_outcomes(ms):
-            highlights.append((ms, snap, hours))
+        ok, reason = _final_pass_reason(ms, require_quotes=(not allow_illiquid))
+        if ok:
+            chosen.append(ms)
+        else:
+            rejects.append((ms, reason))
 
-    return FilterResult(markets=chosen, early_rejects=early_rejects, highlights=highlights)
+    highlights: List[HighlightedOutcome] = []
+    for ms in chosen:
+        for snap, hours in _highlight_outcomes(ms):
+            highlights.append(HighlightedOutcome(market=ms, outcome=snap, hours_to_end=hours))
+
+    return FilterResult(
+        total_markets=len(mkts_raw),
+        candidates=market_list,
+        chosen=chosen,
+        rejected=rejects,
+        highlights=highlights,
+    )
+
+
+def _print_highlighted(highlights: List[Tuple[MarketSnapshot, OutcomeSnapshot, float]]) -> None:
+    if not highlights:
+        print(f"[INFO] 当前无满足（{_highlight_label()}）条件的选项。")
+        return
+
+    print(f"[INFO] 满足（{_highlight_label()}）条件的选项：")
+    for idx, (ms, snap, hours) in enumerate(highlights, start=1):
+        bid = "-" if snap.bid is None else f"{snap.bid:.4f}"
+        ask = "-" if snap.ask is None else f"{snap.ask:.4f}"
+        end_iso = ms.end_time.isoformat() if ms.end_time else "-"
+        print(
+            f"  [{idx}] slug={ms.slug} | 标题={ms.title} | 方向={snap.name}"
+            f" | token_id={snap.token_id or '-'} | bid/ask={bid}/{ask}"
+            f" | ends_in={hours}h | end_time={end_iso}"
+        )
 
 
 # -------------------------------
-# CLI 入口
+# 主流程（含流式模式）
 # -------------------------------
 
 def main():
@@ -811,12 +718,9 @@ def main():
         getc = get_rest_client
         rest_client = getc() if callable(getc) else None
         api_creds = getattr(rest_client, "api_creds", None)
-
-        def g(x, k):
-            if isinstance(x, dict):
-                return x.get(k)
-            return getattr(x, k, None)
-
+        def g(x,k):
+            if isinstance(x, dict): return x.get(k)
+            return getattr(x,k,None)
         ak = g(api_creds, "api_key")
         if ak:
             print(f"[INFO] 已加载 EOA API credentials：{ak[:6]}***{ak[-4:]}")
@@ -850,23 +754,19 @@ def main():
             candidates: List[MarketSnapshot] = []
             for raw in chunk_raw:
                 title = (raw.get("question") or raw.get("title") or "")
-                slug = (raw.get("slug") or "")
+                slug  = (raw.get("slug") or "")
                 if only_pat and (only_pat not in title.lower() and only_pat not in slug.lower()):
                     continue
                 ms = _parse_market(raw)
-
-                # 白名单过滤：若配置了白名单，则仅保留命中的市场
                 if WHITELIST_PATTERNS and _whitelist_match(ms) is None:
-                    reason = "未命中白名单"
                     if args.stream_verbose:
                         _print_snapshot(processed+1, total, ms)
-                        print(f"[TRACE]   -> 结果：{reason}。")
+                        print(f"[TRACE]   -> 结果：未命中白名单。")
                         print(f"[TRACE]   --------------------------------------------------")
                     else:
-                        _print_singleline(ms, reason)
+                        _print_singleline(ms, "未命中白名单")
                     processed += 1
                     continue
-
                 ok, reason = _early_filter_reason(ms, args.min_end_hours, args.legacy_end_days)
                 if ok:
                     candidates.append(ms)
@@ -879,13 +779,13 @@ def main():
                         _print_singleline(ms, reason)
                 processed += 1
 
-            # REST 回补
-            if (not args.skip_orderbook) and candidates and (not args.no_rest_backfill):
+            # 分片内批量 REST 回补
+            if not args.skip_orderbook and candidates and (not args.no_rest_backfill):
                 _rest_books_backfill(candidates, batch_size=args.stream_books_batch_size)
 
-            # 二次筛选 + 高亮
+            # 最终判定（即时输出）
             for ms in candidates:
-                ok2, reason2 = _satisfy_basic_liquidity(ms, allow_illiquid=args.allow_illiquid)
+                ok2, reason2 = _final_pass_reason(ms, require_quotes=(not args.allow_illiquid))
                 if args.stream_verbose:
                     _print_snapshot(processed+1, total, ms)
                     print(f"[TRACE]   -> 结果：{reason2}。")
@@ -896,16 +796,15 @@ def main():
                     chosen_cnt += 1
                     for snap, hours in _highlight_outcomes(ms):
                         highlights.append((ms, snap, hours))
-
-            print(f"[STREAM] 已处理 {processed}/{total} 条，当前 chunk={s//args.stream_chunk_size+1}")
+                processed += 1
 
         print("")
         _print_highlighted(highlights)
-        print(f"\n[INFO] 通过筛选的市场数量：{chosen_cnt}")
+        print(f"\n[INFO] 通过筛选的市场数量：{chosen_cnt} / {len(mkts_raw)}")
         return
 
-    # ---------- 非流式模式 ----------
-    fr = collect_filter_results(
+    # ---------- 非流式模式（批量） ----------
+    result = collect_filter_results(
         min_end_hours=args.min_end_hours,
         max_end_days=args.max_end_days,
         gamma_window_days=args.gamma_window_days,
@@ -919,22 +818,31 @@ def main():
         prefetched_markets=mkts_raw,
     )
 
-    # 打印结果
-    for ms, reason in fr.early_rejects[:args.diagnose_samples]:
-        if args.diagnose:
-            _print_snapshot(0, len(fr.early_rejects), ms)
-            print(f"[TRACE]   -> 结果：{reason}")
+    if args.diagnose:
+        shown = 0
+        for i, (ms, reason) in enumerate(result.rejected[:args.diagnose_samples], start=1):
+            _print_snapshot(i, len(result.rejected), ms)
+            print(f"[TRACE]   -> 结果：{reason}。")
             print(f"[TRACE]   --------------------------------------------------")
-        else:
-            _print_singleline(ms, reason)
+            shown += 1
+        if result.chosen:
+            print("[INFO] （通过样本，最多显示 10 个）")
+            for k, ms in enumerate(result.chosen[:10], start=1):
+                yb = "-" if ms.yes.bid is None else f"{ms.yes.bid:.4f}"
+                ya = "-" if ms.yes.ask is None else f"{ms.yes.ask:.4f}"
+                nb = "-" if ms.no.bid is None else f"{ms.no.bid:.4f}"
+                na = "-" if ms.no.ask is None else f"{ms.no.ask:.4f}"
+                print(f"  [{k}] {ms.slug} | YES bid/ask={yb}/{ya} | NO bid/ask={nb}/{na} | LQ={_fmt_money(ms.liquidity)} Vol={_fmt_money(ms.totalVolume)}")
 
-    for ms in fr.markets:
-        _print_singleline(ms, "通过筛选")
+    printable_highlights = [
+        (ho.market, ho.outcome, ho.hours_to_end) for ho in result.highlights
+    ]
 
     print("")
-    _print_highlighted(fr.highlights)
-    print(f"\n[INFO] 通过筛选的市场数量：{len(fr.markets)}")
+    _print_highlighted(printable_highlights)
 
+    print("")
+    print(f"[INFO] 通过筛选的市场数量：{len(result.chosen)} / {result.total_markets}")
 
 if __name__ == "__main__":
     main()
