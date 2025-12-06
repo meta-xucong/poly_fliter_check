@@ -33,6 +33,7 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 GAMMA_HOST = os.environ.get("GAMMA_HOST", "https://gamma-api.polymarket.com").rstrip("/")
 CLOB_HOST = os.environ.get("CLOB_HOST", "https://clob.polymarket.com").rstrip("/")
@@ -89,23 +90,55 @@ def _to_unix(ts: str) -> Optional[int]:
 
 
 def _parse_token_ids(raw: str | Sequence[str] | None) -> List[str]:
-    """解析 clobTokenIds 字段，兼容列表/JSON 字符串/分隔字符串。"""
+    """解析 clobTokenIds 字段，兼容列表/JSON 字符串/分隔字符串，并尽量去除包裹符号。"""
+
     if raw is None:
         return []
+
     if isinstance(raw, str):
-        # 优先尝试 JSON 解析
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                return [str(x).strip() for x in parsed if str(x).strip()]
-        except json.JSONDecodeError:
-            pass
-        # 兼容用 | 或 , 连接的字符串
-        if "|" in raw or "," in raw:
-            return [seg.strip() for seg in re.split(r"[|,]", raw) if seg.strip()]
-        cleaned = raw.strip()
-        return [cleaned] if cleaned else []
+        text = raw.strip()
+        if not text:
+            return []
+
+        # 优先 JSON 解析；若为单引号包裹也做一次转换
+        for candidate in (text, text.replace("'", '"')):
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, list):
+                    return [str(x).strip() for x in parsed if str(x).strip()]
+            except json.JSONDecodeError:
+                pass
+
+        # 去掉外层括号/中括号后按常见分隔符拆分
+        trimmed = re.sub(r"^[\[(]+|[\])]+$", "", text)
+        if "|" in trimmed or "," in trimmed:
+            tokens = [seg.strip() for seg in re.split(r"[|,]", trimmed) if seg.strip()]
+        else:
+            tokens = [trimmed] if trimmed else []
+
+        # 如果仍然只有一个字符串，尝试从其中提取类似 token 的片段
+        if len(tokens) == 1 and (" " in tokens[0] or "\"" in tokens[0]):
+            candidates = re.findall(r"[A-Za-z0-9]{20,}", tokens[0])
+            tokens = candidates or tokens
+
+        return tokens
+
     return [str(x).strip() for x in raw if str(x).strip()]
+
+
+def _extract_token_ids_from_tokens(raw_tokens: Sequence[Dict] | None) -> List[str]:
+    """从 tokens 字段提取 tokenId/uid，作为 clobTokenIds 的兜底。"""
+
+    if not raw_tokens:
+        return []
+
+    token_ids: List[str] = []
+    for item in raw_tokens:
+        if isinstance(item, dict):
+            token_id = item.get("tokenId") or item.get("id") or item.get("uid")
+            if token_id:
+                token_ids.append(str(token_id).strip())
+    return token_ids
 
 
 def _normalize_outcomes(raw_outcomes: Sequence[str] | str | None) -> List[str]:
@@ -143,6 +176,14 @@ def _normalize_outcomes(raw_outcomes: Sequence[str] | str | None) -> List[str]:
         if text:
             cleaned.append(text)
     return cleaned
+
+
+def _extract_slug_from_url(url: str | None) -> str:
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    parts = [p for p in parsed.path.split("/") if p]
+    return parts[-1] if parts else ""
 
 
 def _safe_float(value: str | float | int | None) -> float:
@@ -261,7 +302,14 @@ def build_market_records(markets: List[Dict], min_volume: float) -> List[MarketR
 
         outcomes_raw = mk.get("outcomes") or mk.get("shortOutcomes") or []
         outcomes = _normalize_outcomes(outcomes_raw)
-        token_ids = _parse_token_ids(mk.get("clobTokenIds"))
+        token_ids = _parse_token_ids(mk.get("clobTokenIds") or mk.get("clob_token_ids") or mk.get("clobTokens"))
+
+        # 尝试从 tokens 字段兜底补齐缺失的 token_ids
+        if len(token_ids) < len(outcomes):
+            token_fallback = _extract_token_ids_from_tokens(mk.get("tokens"))
+            if token_fallback:
+                # 仅在 fallback 能提供更多 token 时合并
+                token_ids = token_ids + [tid for tid in token_fallback if tid not in token_ids]
 
         if not market_slug or not outcomes or not token_ids:
             print(
@@ -269,22 +317,24 @@ def build_market_records(markets: List[Dict], min_volume: float) -> List[MarketR
             )
             continue
 
-        # 对齐 outcomes 与 token_ids，长度不一致时裁剪并提示
-        pair_len = min(len(outcomes), len(token_ids))
-        if pair_len == 0:
-            print(f"[WARN] 跳过盘口（outcome/token 对齐失败）：slug={market_slug!r}")
-            continue
+        # 对齐 outcomes 与 token_ids，长度不一致时尝试补齐，仍失败则跳过以避免缺失 outcome 价格
         if len(outcomes) != len(token_ids):
             print(
-                f"[WARN] outcomes 与 token_ids 长度不一致，将裁剪：slug={market_slug!r}, outcomes={len(outcomes)}, tokens={len(token_ids)}"
+                f"[WARN] outcomes 与 token_ids 长度不一致，将跳过：slug={market_slug!r}, outcomes={len(outcomes)}, tokens={len(token_ids)}"
             )
-            outcomes = outcomes[:pair_len]
-            token_ids = token_ids[:pair_len]
+            continue
 
+        event_slug = str(
+            mk.get("eventSlug")
+            or mk.get("event_slug")
+            or _extract_slug_from_url(mk.get("eventUrl") or mk.get("event_url"))
+            or ""
+        )
+        event_question = str(mk.get("eventQuestion") or mk.get("eventTitle") or mk.get("event") or "")
         records.append(
             MarketRecord(
-                event_slug=str(mk.get("eventSlug") or mk.get("event_slug") or ""),
-                event_question=str(mk.get("eventQuestion") or mk.get("eventTitle") or mk.get("event") or ""),
+                event_slug=event_slug,
+                event_question=event_question,
                 market_id=market_id,
                 market_slug=market_slug,
                 market_question=str(mk.get("question") or mk.get("title") or ""),
