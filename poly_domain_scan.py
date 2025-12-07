@@ -219,6 +219,12 @@ def _safe_float(value: str | float | int | None) -> float:
         return 0.0
 
 
+def _normalize_tag_key(text: str) -> str:
+    """统一标签键的格式，去除非字母数字字符并转为小写，便于模糊匹配。"""
+
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
 class DomainResolver:
     GENERIC_SPORT_TAGS = {1, 100639}
 
@@ -246,7 +252,11 @@ class DomainResolver:
             tag_id = tag.get("id")
             label = str(tag.get("label") or tag.get("slug") or tag.get("name") or "").lower()
             if tag_id is not None and label:
-                self._tag_lookup[label] = int(tag_id)
+                tag_id_int = int(tag_id)
+                norm_label = _normalize_tag_key(label)
+                self._tag_lookup[label] = tag_id_int
+                if norm_label:
+                    self._tag_lookup.setdefault(norm_label, tag_id_int)
 
     def resolve(self, domain: str, sports: Optional[List[str]] = None, custom_tags: Optional[List[str]] = None) -> List[int]:
         domain = domain.lower()
@@ -256,16 +266,18 @@ class DomainResolver:
         tag_ids: List[int] = []
         if domain == "custom" and custom_tags:
             for tag in custom_tags:
+                normalized = _normalize_tag_key(tag)
                 if tag.isdigit():
                     tag_ids.append(int(tag))
-                elif tag in self._tag_lookup:
-                    tag_ids.append(self._tag_lookup[tag])
+                elif normalized in self._tag_lookup:
+                    tag_ids.append(self._tag_lookup[normalized])
         elif domain == "esports":
             for hint in self.esports_tag_hints:
+                normalized = _normalize_tag_key(hint)
                 if hint.isdigit():
                     tag_ids.append(int(hint))
-                elif hint.lower() in self._tag_lookup:
-                    tag_ids.append(self._tag_lookup[hint.lower()])
+                elif normalized in self._tag_lookup:
+                    tag_ids.append(self._tag_lookup[normalized])
         else:
             # sports_all 或者指定体育种类
             if sports:
