@@ -38,6 +38,17 @@
     --output /home/trader/polymarket_api/poly_fliter_check/markets_history.csv
   ```
 
+- 电竞 DOTA2 示例（参数同上，仅切换领域与标签线索）：
+  ```bash
+  python3 /home/trader/polymarket_api/poly_fliter_check/poly_domain_scan.py \
+    --domain esports \
+    --esports-tag-hints DOTA2 \
+    --days 1 \
+    --min-volume 50000 \
+    --fidelity 60 \
+    --output /home/trader/polymarket_api/poly_fliter_check/markets_history.csv
+  ```
+
 ## 输出文件说明
 - 盘口文件：包含事件 slug、问题、市场类型、outcomes、token ids、创建/截止/开赛时间与成交量等。
 - 价格文件：每个 outcome 的时间序列，含 `price_raw` 与换算的 `price_prob`。

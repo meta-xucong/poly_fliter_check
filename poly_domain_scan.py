@@ -20,6 +20,15 @@
         --fidelity 60 \
         --output /home/trader/polymarket_api/poly_fliter_check/markets_history.csv
 
+    # 电竞 DOTA2 示例（参数与上例一致，仅切换领域与标签线索）
+    python3 /home/trader/polymarket_api/poly_fliter_check/poly_domain_scan.py \
+        --domain esports \
+        --esports-tag-hints DOTA2 \
+        --days 1 \
+        --min-volume 50000 \
+        --fidelity 60 \
+        --output /home/trader/polymarket_api/poly_fliter_check/markets_history.csv
+
 参数说明：
 - domain：预设领域（sports_all 表示所有体育；esports 表示电竞；custom 需配合 --tags）。
 - sports：当 domain=sports_all 时可用逗号分隔指定具体体育种类（NBA,CBB,Soccer 等）。
