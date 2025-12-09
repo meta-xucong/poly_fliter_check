@@ -83,15 +83,26 @@ class PricePoint:
     price_prob: float
 
 
-def _fetch_json(url: str, params: Optional[Dict] = None) -> Dict:
+def _fetch_json(url: str, params: Optional[Dict] = None, *, retries: int = 3, backoff: float = 2.0) -> Dict:
     import requests
 
-    try:
-        resp = requests.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"请求失败：{url} -> {exc}") from exc
+    attempt = 1
+    while True:
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as exc:
+            if attempt >= retries:
+                raise RuntimeError(f"请求失败：{url} -> {exc}") from exc
+
+            wait = backoff ** (attempt - 1)
+            print(
+                f"[WARN] 请求失败（{attempt}/{retries}）：{url} -> {exc}，{wait:.1f}s 后重试…",
+                flush=True,
+            )
+            time.sleep(wait)
+            attempt += 1
 
 
 def _parse_date(text: str) -> dt.datetime:
