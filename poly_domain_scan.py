@@ -389,7 +389,7 @@ def build_market_records(markets: List[Dict], min_volume: float) -> List[MarketR
 
 
 def fetch_price_history(token_id: str, start_ts: int, end_ts: int, fidelity: int) -> List[Tuple[int, float]]:
-    slice_seconds = 3 * 86400
+    slice_seconds = 7 * 86400
     window_start = start_ts
     slice_index = 1
     result: List[Tuple[int, float]] = []
@@ -422,7 +422,7 @@ def fetch_price_history(token_id: str, start_ts: int, end_ts: int, fidelity: int
         slice_index += 1
         window_start = window_end
         if window_start < end_ts:
-            time.sleep(5)
+            time.sleep(1)
 
     return result
 
