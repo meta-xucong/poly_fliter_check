@@ -389,19 +389,30 @@ def build_market_records(markets: List[Dict], min_volume: float) -> List[MarketR
 
 
 def fetch_price_history(token_id: str, start_ts: int, end_ts: int, fidelity: int) -> List[Tuple[int, float]]:
-    params = {"market": token_id, "startTs": start_ts, "endTs": end_ts, "fidelity": fidelity}
-    data = _fetch_json(f"{CLOB_HOST}/prices-history", params=params)
-    history = data.get("history") or []
+    slice_seconds = 3 * 86400
+    window_start = start_ts
     result: List[Tuple[int, float]] = []
-    for point in history:
-        t = point.get("t")
-        p = point.get("p")
-        if t is None or p is None:
-            continue
-        try:
-            result.append((int(t), float(p)))
-        except (TypeError, ValueError):
-            continue
+
+    while window_start < end_ts:
+        window_end = min(window_start + slice_seconds, end_ts)
+        params = {"market": token_id, "startTs": window_start, "endTs": window_end, "fidelity": fidelity}
+        data = _fetch_json(f"{CLOB_HOST}/prices-history", params=params)
+        history = data.get("history") or []
+
+        for point in history:
+            t = point.get("t")
+            p = point.get("p")
+            if t is None or p is None:
+                continue
+            try:
+                result.append((int(t), float(p)))
+            except (TypeError, ValueError):
+                continue
+
+        window_start = window_end
+        if window_start < end_ts:
+            time.sleep(5)
+
     return result
 
 
