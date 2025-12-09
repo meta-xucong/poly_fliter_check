@@ -391,10 +391,16 @@ def build_market_records(markets: List[Dict], min_volume: float) -> List[MarketR
 def fetch_price_history(token_id: str, start_ts: int, end_ts: int, fidelity: int) -> List[Tuple[int, float]]:
     slice_seconds = 3 * 86400
     window_start = start_ts
+    slice_index = 1
     result: List[Tuple[int, float]] = []
 
     while window_start < end_ts:
         window_end = min(window_start + slice_seconds, end_ts)
+        print(
+            f"[INFO] 价格切片 {slice_index} 开始：token={token_id}, "
+            f"{dt.datetime.utcfromtimestamp(window_start)} -> {dt.datetime.utcfromtimestamp(window_end)}",
+            flush=True,
+        )
         params = {"market": token_id, "startTs": window_start, "endTs": window_end, "fidelity": fidelity}
         data = _fetch_json(f"{CLOB_HOST}/prices-history", params=params)
         history = data.get("history") or []
@@ -409,6 +415,11 @@ def fetch_price_history(token_id: str, start_ts: int, end_ts: int, fidelity: int
             except (TypeError, ValueError):
                 continue
 
+        print(
+            f"[INFO] 价格切片 {slice_index} 完成：token={token_id}, 数据点={len(history)}",
+            flush=True,
+        )
+        slice_index += 1
         window_start = window_end
         if window_start < end_ts:
             time.sleep(5)
@@ -446,11 +457,16 @@ def collect_price_points(
 
     points: List[PricePoint] = []
     missing_tokens: List[str] = []
-    for outcome, token_id in zip(record.outcomes, record.token_ids):
+    for idx, (outcome, token_id) in enumerate(zip(record.outcomes, record.token_ids), start=1):
         if not token_id:
             missing_tokens.append(outcome)
             continue
 
+        print(
+            f"[INFO] 拉取盘口价格：slug={record.market_slug!r}, outcome={outcome!r}, "
+            f"第 {idx}/{len(record.token_ids)} 个 outcome",
+            flush=True,
+        )
         history = fetch_price_history(token_id, start_ts, end_ts, fidelity)
         if not history:
             print(f"[WARN] 未获取到价格历史：slug={record.market_slug!r}, token={token_id}")
@@ -718,7 +734,12 @@ def main() -> None:
         print(f"共获取盘口 {len(records)} 个，准备拉取价格历史…")
 
         price_points: List[PricePoint] = []
-        for rec in records:
+        total = len(records)
+        for rec_idx, rec in enumerate(records, start=1):
+            print(
+                f"[INFO] 处理盘口 {rec_idx}/{total}：slug={rec.market_slug!r} ({rec.market_question})",
+                flush=True,
+            )
             price_points.extend(
                 collect_price_points(
                     rec,
