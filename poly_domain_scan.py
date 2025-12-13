@@ -257,17 +257,33 @@ class DomainResolver:
             if sport_name:
                 self._sports_tags[sport_name] = tag_ids
 
-        tags_resp = _fetch_json(f"{GAMMA_HOST}/tags") or []
-        tags_list: Iterable[Dict] = tags_resp if isinstance(tags_resp, list) else tags_resp.get("tags", [])
-        for tag in tags_list:
-            tag_id = tag.get("id")
-            label = str(tag.get("label") or tag.get("slug") or tag.get("name") or "").lower()
-            if tag_id is not None and label:
+        offset = 0
+        limit = 200
+        while True:
+            tags_resp = _fetch_json(f"{GAMMA_HOST}/tags", params={"limit": limit, "offset": offset}) or []
+            tags_list: Iterable[Dict] = tags_resp if isinstance(tags_resp, list) else tags_resp.get("tags", [])
+            tags_batch = list(tags_list)
+            if not tags_batch:
+                break
+
+            for tag in tags_batch:
+                tag_id = tag.get("id")
+                if tag_id is None:
+                    continue
+
                 tag_id_int = int(tag_id)
-                norm_label = _normalize_tag_key(label)
-                self._tag_lookup[label] = tag_id_int
-                if norm_label:
-                    self._tag_lookup.setdefault(norm_label, tag_id_int)
+                keys = [str(tag.get(k) or "").lower() for k in ("label", "slug", "name")]
+                for key in keys:
+                    if not key:
+                        continue
+                    norm_key = _normalize_tag_key(key)
+                    self._tag_lookup[key] = tag_id_int
+                    if norm_key:
+                        self._tag_lookup[norm_key] = tag_id_int
+
+            if len(tags_batch) < limit:
+                break
+            offset += limit
 
     def resolve(self, domain: str, sports: Optional[List[str]] = None, custom_tags: Optional[List[str]] = None) -> List[int]:
         domain = domain.lower()
